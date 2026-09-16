@@ -1,0 +1,229 @@
+name: Build Zenith resource-pack fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: 3.7.0+linux.26.2.0.resourcepackfix
+    steps:
+      - name: Check out exact upstream version
+        uses: actions/checkout@v7
+        with:
+          repository: rfresh2/ZenithProxy
+          ref: a7020137e86f11d1219322368d6ec045429565b8
+          persist-credentials: false
+
+      - name: Apply resource-pack fix
+        shell: bash
+        run: |
+          cat > /tmp/zenith-resourcepack.patch <<'PATCH'
+          diff --git a/src/main/java/com/zenith/cache/data/config/ConfigurationCache.java b/src/main/java/com/zenith/cache/data/config/ConfigurationCache.java
+          index 5dda227b5..bb41e020e 100644
+          --- a/src/main/java/com/zenith/cache/data/config/ConfigurationCache.java
+          +++ b/src/main/java/com/zenith/cache/data/config/ConfigurationCache.java
+          @@ -30,15 +30,8 @@ public void getPackets(@NonNull final Consumer<Packet> consumer, final @NonNull
+           
+               public void getConfigurationPackets(@NonNull final Consumer<Packet> consumer, final @NonNull TcpSession session) {
+                   consumer.accept(new ClientboundUpdateEnabledFeaturesPacket(this.enabledFeatures));
+          -        // todo: we need to make the zenith mc server wait until the player has sent a response to the resource pack prompt(s)
+          -//        resourcePacks.forEach((uuid, resourcePack) -> consumer.accept(new ClientboundResourcePackPushPacket(
+          -//            resourcePack.id(),
+          -//            resourcePack.url(),
+          -//            resourcePack.hash(),
+          -//            resourcePack.required(),
+          -//            resourcePack.prompt()
+          -//        )));
+                   consumer.accept(new ClientboundUpdateTagsPacket(this.tags));
+          +        // resource pack sync to players handled by com.zenith.network.server.ResourcePackSync
+               }
+           
+               @Override
+          diff --git a/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java b/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java
+          index b58a12926..0db4b68c6 100644
+          --- a/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java
+          +++ b/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java
+          @@ -29,6 +29,7 @@
+           import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundClientInformationPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundKeepAlivePacket;
+           import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundPongPacket;
+          +import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.*;
+           import org.geysermc.mcprotocollib.protocol.packet.configuration.serverbound.ServerboundFinishConfigurationPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.handshake.serverbound.ClientIntentionPacket;
+          @@ -305,6 +306,7 @@ private PacketCodecRegistries() {}
+                       .setPriority(0)
+                       .state(ProtocolState.CONFIGURATION, PacketHandlerStateCodec.serverBuilder()
+                           .inbound(ServerboundFinishConfigurationPacket.class, new FinishConfigurationHandler())
+          +                .inbound(ServerboundResourcePackPacket.class, new SResourcePackHandler())
+                           .inbound(ServerboundClientInformationPacket.class, SClientInformationHandler.INSTANCE)
+                           .outbound(ClientboundKeepAlivePacket.class, KeepAliveOutgoingHandler.INSTANCE)
+                           .postOutbound(ClientboundFinishConfigurationPacket.class, new ClientFinishConfigurationPostOutgoingHandler())
+          diff --git a/src/main/java/com/zenith/network/server/ResourcePackSync.java b/src/main/java/com/zenith/network/server/ResourcePackSync.java
+          new file mode 100644
+          index 000000000..75e306039
+          --- /dev/null
+          +++ b/src/main/java/com/zenith/network/server/ResourcePackSync.java
+          @@ -0,0 +1,60 @@
+          +package com.zenith.network.server;
+          +
+          +import com.zenith.cache.data.config.ResourcePack;
+          +import com.zenith.event.player.PlayerConfigurationEvent;
+          +import lombok.Getter;
+          +import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
+          +import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
+          +import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundFinishConfigurationPacket;
+          +import org.jspecify.annotations.Nullable;
+          +
+          +import java.util.ArrayDeque;
+          +import java.util.Collection;
+          +import java.util.UUID;
+          +
+          +import static com.zenith.Globals.EVENT_BUS;
+          +import static com.zenith.Globals.SERVER_LOG;
+          +
+          +public class ResourcePackSync {
+          +    private final ServerSession session;
+          +    private final ArrayDeque<ResourcePack> pending = new ArrayDeque<>();
+          +    private @Nullable UUID currentPackId;
+          +    private boolean started;
+          +    @Getter private boolean complete;
+          +
+          +    public ResourcePackSync(ServerSession session) {
+          +        this.session = session;
+          +    }
+          +
+          +    public void start(Collection<ResourcePack> packs) {
+          +        if (started) return;
+          +        started = true;
+          +        // Snapshot the cache: other connections and upstream updates must not alter this exchange.
+          +        pending.addAll(packs);
+          +        sendNext();
+          +    }
+          +
+          +    public void handleResponse(ServerboundResourcePackPacket packet) {
+          +        if (currentPackId == null || !currentPackId.equals(packet.getId())) {
+          +            SERVER_LOG.warn("Received unexpected resource pack response from {} for pack {}", session, packet.getId());
+          +            return;
+          +        }
+          +        switch (packet.getStatus()) {
+          +            case ACCEPTED, DOWNLOADED -> { }
+          +            case SUCCESSFULLY_LOADED, DECLINED, FAILED_DOWNLOAD, INVALID_URL, FAILED_RELOAD, DISCARDED -> sendNext();
+          +        }
+          +    }
+          +
+          +    private void sendNext() {
+          +        var pack = pending.poll();
+          +        if (pack == null) {
+          +            currentPackId = null;
+          +            complete = true;
+          +            EVENT_BUS.post(new PlayerConfigurationEvent.Exiting(session));
+          +            session.sendAsync(new ClientboundFinishConfigurationPacket());
+          +        } else {
+          +            currentPackId = pack.id();
+          +            session.sendAsync(new ClientboundResourcePackPushPacket(pack.id(), pack.url(), pack.hash(), false, pack.prompt()));
+          +        }
+          +    }
+          +}
+          diff --git a/src/main/java/com/zenith/network/server/ServerSession.java b/src/main/java/com/zenith/network/server/ServerSession.java
+          index ffbb896a5..07398d55a 100644
+          --- a/src/main/java/com/zenith/network/server/ServerSession.java
+          +++ b/src/main/java/com/zenith/network/server/ServerSession.java
+          @@ -95,6 +95,7 @@ public class ServerSession extends TcpServerSession {
+               // we have performed the configuration phase at zenith
+               // any subsequent configurations should pass through to client
+               protected boolean isConfigured = false;
+          +    protected final ResourcePackSync resourcePackConfiguration = new ResourcePackSync(this);
+               // next player move is the initial spawn tp
+               protected boolean spawning = false;
+               // note: on 1.21.3, the position packet is sent before the teleport accept packet
+          diff --git a/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java b/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java
+          index 87aab8369..cfb86885d 100644
+          --- a/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java
+          +++ b/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java
+          @@ -7,7 +7,6 @@
+           import net.kyori.adventure.key.Key;
+           import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
+           import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundCustomPayloadPacket;
+          -import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundFinishConfigurationPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.login.serverbound.ServerboundLoginAcknowledgedPacket;
+           
+           import static com.zenith.Globals.*;
+          @@ -35,8 +34,7 @@ public ServerboundLoginAcknowledgedPacket apply(final ServerboundLoginAcknowledg
+                   CACHE.getRegistriesCache().getRegistryPackets(session::sendAsync, session);
+                   CACHE.getConfigurationCache().getConfigurationPackets(session::sendAsync, session);
+                   session.sendAsync(new ClientboundCustomPayloadPacket(Key.key("minecraft:brand"), CACHE.getChunkCache().getServerBrand()));
+          -        EVENT_BUS.post(new PlayerConfigurationEvent.Exiting(session));
+          -        session.sendAsync(new ClientboundFinishConfigurationPacket());
+          +        session.getResourcePackConfiguration().start(CACHE.getConfigurationCache().getResourcePacks().values());
+                   return null;
+               }
+           }
+          diff --git a/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java b/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java
+          new file mode 100644
+          index 000000000..914c58f58
+          --- /dev/null
+          +++ b/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java
+          @@ -0,0 +1,14 @@
+          +package com.zenith.network.server.handler.shared.incoming;
+          +
+          +import com.zenith.network.codec.PacketHandler;
+          +import com.zenith.network.server.ServerSession;
+          +import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
+          +
+          +public class SResourcePackHandler implements PacketHandler<ServerboundResourcePackPacket, ServerSession> {
+          +    @Override
+          +    public ServerboundResourcePackPacket apply(ServerboundResourcePackPacket packet, ServerSession session) {
+          +        if (session.isConfigured()) return packet;
+          +        session.getResourcePackConfiguration().handleResponse(packet);
+          +        return null;
+          +    }
+          +}
+          PATCH
+          git apply --check /tmp/zenith-resourcepack.patch
+          git apply /tmp/zenith-resourcepack.patch
+          git diff --check
+
+      - name: Set up GraalVM (build machine only)
+        uses: graalvm/setup-graalvm@v1
+        with:
+          version: '25.3'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build native Linux executable
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew nativeCompile -x test --no-daemon --max-workers=2 -Dorg.gradle.jvmargs=-Xmx2g
+
+      - name: Package executable and companion libraries
+        shell: bash
+        run: |
+          test -x build/native/nativeCompile/ZenithProxy
+          mkdir -p package
+          cp build/native/nativeCompile/ZenithProxy package/
+          for lib in build/native/nativeCompile/*.so; do
+            if [ -f "$lib" ]; then cp "$lib" package/; fi
+          done
+          cp /tmp/zenith-resourcepack.patch package/
+          cp LICENSE package/
+          printf '%s\n' 'Base: https://github.com/rfresh2/ZenithProxy/commit/a7020137e86f11d1219322368d6ec045429565b8' 'Fix: https://github.com/rfresh2/ZenithProxy/commit/182bc3452163aee09d97241016bcfb49b7641c34' 'Apply the enclosed patch to the base to reproduce the source.' > package/SOURCE.txt
+          tar -czf ZenithProxy-resourcepack-linux.tar.gz -C package .
+          sha256sum ZenithProxy-resourcepack-linux.tar.gz > ZenithProxy-resourcepack-linux.tar.gz.sha256
+
+      - name: Upload download bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ZenithProxy-resourcepack-linux
+          path: |
+            ZenithProxy-resourcepack-linux.tar.gz
+            ZenithProxy-resourcepack-linux.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
