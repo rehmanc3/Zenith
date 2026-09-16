@@ -2,6 +2,8 @@ name: Build Zenith resource-pack fix
 
 on:
   workflow_dispatch:
+  push:
+    branches: [resourcepack-async-join]
 
 permissions:
   contents: read
@@ -11,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      RELEASE_TAG: 3.7.0+linux.26.2.0.resourcepackfix
+      RELEASE_TAG: 3.7.0+linux.26.2.0.resourcepackasync
     steps:
       - name: Check out exact upstream version
         uses: actions/checkout@v7
@@ -190,6 +192,173 @@ jobs:
           git apply /tmp/zenith-resourcepack.patch
           git diff --check
 
+      - name: Apply async join follow-up
+        shell: bash
+        run: |
+          cat > /tmp/zenith-resourcepack-async.patch <<'PATCH'
+          diff --git a/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java b/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java
+          --- a/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java
+          +++ b/src/main/java/com/zenith/network/codec/PacketCodecRegistries.java
+          @@ -330,6 +330,7 @@
+                           .build())
+                       .state(ProtocolState.GAME, PacketHandlerStateCodec.serverBuilder()
+                           .inbound(ServerboundConfigurationAcknowledgedPacket.class, new ConfigurationAckHandler())
+          +                .inbound(ServerboundResourcePackPacket.class, new SResourcePackHandler())
+                           .inbound(ServerboundPongPacket.class, new PongHandler())
+                           .inbound(ServerboundClientInformationPacket.class, SClientInformationHandler.INSTANCE)
+                           .inbound(ServerboundChatSessionUpdatePacket.class, new SChatSessionUpdateHandler())
+          diff --git a/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java b/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java
+          --- a/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java
+          +++ b/src/main/java/com/zenith/network/server/handler/shared/incoming/LoginAckHandler.java
+          @@ -7,6 +7,7 @@
+           import net.kyori.adventure.key.Key;
+           import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
+           import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundCustomPayloadPacket;
+          +import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundFinishConfigurationPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.login.serverbound.ServerboundLoginAcknowledgedPacket;
+           
+           import static com.zenith.Globals.*;
+          @@ -34,7 +35,8 @@
+                   CACHE.getRegistriesCache().getRegistryPackets(session::sendAsync, session);
+                   CACHE.getConfigurationCache().getConfigurationPackets(session::sendAsync, session);
+                   session.sendAsync(new ClientboundCustomPayloadPacket(Key.key("minecraft:brand"), CACHE.getChunkCache().getServerBrand()));
+          -        session.getResourcePackConfiguration().start(CACHE.getConfigurationCache().getResourcePacks().values());
+          +        EVENT_BUS.post(new PlayerConfigurationEvent.Exiting(session));
+          +        session.sendAsync(new ClientboundFinishConfigurationPacket());
+                   return null;
+               }
+           }
+          diff --git a/src/main/java/com/zenith/network/server/handler/ProxyServerLoginHandler.java b/src/main/java/com/zenith/network/server/handler/ProxyServerLoginHandler.java
+          --- a/src/main/java/com/zenith/network/server/handler/ProxyServerLoginHandler.java
+          +++ b/src/main/java/com/zenith/network/server/handler/ProxyServerLoginHandler.java
+          @@ -21,6 +21,8 @@
+           import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundLoginPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundServerDataPacket;
+           
+          +import java.util.List;
+          +
+           import static com.zenith.Globals.*;
+           import static java.util.Arrays.asList;
+           import static java.util.Objects.nonNull;
+          @@ -131,5 +133,10 @@
+                       "ZenithProxy Support", "https://discord.gg/nJZrSaRKtb"
+                   )));
+                   connection.setConfigured(true);
+          +        // Let the player enter the game before beginning cached resource-pack downloads.
+          +        var packs = List.copyOf(CACHE.getConfigurationCache().getResourcePacks().values());
+          +        connection.getEventLoop().execute(() -> {
+          +            if (connection.isConnected()) connection.getResourcePackConfiguration().start(packs);
+          +        });
+               }
+           }
+          diff --git a/src/main/java/com/zenith/network/server/ResourcePackSync.java b/src/main/java/com/zenith/network/server/ResourcePackSync.java
+          --- a/src/main/java/com/zenith/network/server/ResourcePackSync.java
+          +++ b/src/main/java/com/zenith/network/server/ResourcePackSync.java
+          @@ -1,24 +1,27 @@
+           package com.zenith.network.server;
+           
+           import com.zenith.cache.data.config.ResourcePack;
+          -import com.zenith.event.player.PlayerConfigurationEvent;
+           import lombok.Getter;
+           import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
+           import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
+          -import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundFinishConfigurationPacket;
+           import org.jspecify.annotations.Nullable;
+           
+          +import java.net.URI;
+           import java.util.ArrayDeque;
+           import java.util.Collection;
+          +import java.util.HashSet;
+          +import java.util.Set;
+           import java.util.UUID;
+          +import java.util.concurrent.TimeUnit;
+           
+          -import static com.zenith.Globals.EVENT_BUS;
+           import static com.zenith.Globals.SERVER_LOG;
+           
+           public class ResourcePackSync {
+               private final ServerSession session;
+               private final ArrayDeque<ResourcePack> pending = new ArrayDeque<>();
+          +    private final Set<UUID> cachedPackIds = new HashSet<>();
+               private @Nullable UUID currentPackId;
+          +    private long sentAtNanos;
+               private boolean started;
+               @Getter private boolean complete;
+           
+          @@ -31,18 +34,28 @@
+                   started = true;
+                   // Snapshot the cache: other connections and upstream updates must not alter this exchange.
+                   pending.addAll(packs);
+          +        for (var pack : packs) cachedPackIds.add(pack.id());
+          +        SERVER_LOG.info("Sending {} cached resource pack(s) after game login for {}", packs.size(), session.getName());
+                   sendNext();
+               }
+           
+          -    public void handleResponse(ServerboundResourcePackPacket packet) {
+          -        if (currentPackId == null || !currentPackId.equals(packet.getId())) {
+          -            SERVER_LOG.warn("Received unexpected resource pack response from {} for pack {}", session, packet.getId());
+          -            return;
+          -        }
+          +    public boolean handleResponse(ServerboundResourcePackPacket packet) {
+          +        // Responses to live upstream pushes still need to reach the upstream server.
+          +        if (!cachedPackIds.contains(packet.getId())) return false;
+          +        if (!packet.getId().equals(currentPackId)) return true;
+          +        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - sentAtNanos);
+                   switch (packet.getStatus()) {
+          -            case ACCEPTED, DOWNLOADED -> { }
+          -            case SUCCESSFULLY_LOADED, DECLINED, FAILED_DOWNLOAD, INVALID_URL, FAILED_RELOAD, DISCARDED -> sendNext();
+          +            case ACCEPTED -> { }
+          +            case DOWNLOADED -> SERVER_LOG.info("Cached resource pack {} downloaded by {} in {} ms",
+          +                packet.getId(), session.getName(), elapsedMs);
+          +            case SUCCESSFULLY_LOADED, DECLINED, FAILED_DOWNLOAD, INVALID_URL, FAILED_RELOAD, DISCARDED -> {
+          +                SERVER_LOG.info("Cached resource pack {} finished for {} with {} after {} ms",
+          +                    packet.getId(), session.getName(), packet.getStatus(), elapsedMs);
+          +                cachedPackIds.remove(packet.getId());
+          +                sendNext();
+          +            }
+                   }
+          +        return true;
+               }
+           
+               private void sendNext() {
+          @@ -50,10 +63,17 @@
+                   if (pack == null) {
+                       currentPackId = null;
+                       complete = true;
+          -            EVENT_BUS.post(new PlayerConfigurationEvent.Exiting(session));
+          -            session.sendAsync(new ClientboundFinishConfigurationPacket());
+                   } else {
+                       currentPackId = pack.id();
+          +            sentAtNanos = System.nanoTime();
+          +            String host;
+          +            try {
+          +                host = URI.create(pack.url()).getHost();
+          +            } catch (IllegalArgumentException e) {
+          +                host = "invalid";
+          +            }
+          +            SERVER_LOG.info("Prompting {} for cached resource pack {} from host {}",
+          +                session.getName(), pack.id(), host);
+                       session.sendAsync(new ClientboundResourcePackPushPacket(pack.id(), pack.url(), pack.hash(), false, pack.prompt()));
+                   }
+               }
+          diff --git a/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java b/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java
+          --- a/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java
+          +++ b/src/main/java/com/zenith/network/server/handler/shared/incoming/SResourcePackHandler.java
+          @@ -7,8 +7,6 @@
+           public class SResourcePackHandler implements PacketHandler<ServerboundResourcePackPacket, ServerSession> {
+               @Override
+               public ServerboundResourcePackPacket apply(ServerboundResourcePackPacket packet, ServerSession session) {
+          -        if (session.isConfigured()) return packet;
+          -        session.getResourcePackConfiguration().handleResponse(packet);
+          -        return null;
+          +        return session.getResourcePackConfiguration().handleResponse(packet) ? null : packet;
+               }
+           }
+          PATCH
+          git apply --check /tmp/zenith-resourcepack-async.patch
+          git apply /tmp/zenith-resourcepack-async.patch
+          git diff --check
+
       - name: Set up GraalVM (build machine only)
         uses: graalvm/setup-graalvm@v1
         with:
@@ -213,17 +382,18 @@ jobs:
             if [ -f "$lib" ]; then cp "$lib" package/; fi
           done
           cp /tmp/zenith-resourcepack.patch package/
+          cp /tmp/zenith-resourcepack-async.patch package/
           cp LICENSE package/
-          printf '%s\n' 'Base: https://github.com/rfresh2/ZenithProxy/commit/a7020137e86f11d1219322368d6ec045429565b8' 'Fix: https://github.com/rfresh2/ZenithProxy/commit/182bc3452163aee09d97241016bcfb49b7641c34' 'Apply the enclosed patch to the base to reproduce the source.' > package/SOURCE.txt
-          tar -czf ZenithProxy-resourcepack-linux.tar.gz -C package .
-          sha256sum ZenithProxy-resourcepack-linux.tar.gz > ZenithProxy-resourcepack-linux.tar.gz.sha256
+          printf '%s\n' 'Base: https://github.com/rfresh2/ZenithProxy/commit/a7020137e86f11d1219322368d6ec045429565b8' 'Fix: https://github.com/rfresh2/ZenithProxy/commit/182bc3452163aee09d97241016bcfb49b7641c34' 'Apply both enclosed patches in order to the base to reproduce the source.' > package/SOURCE.txt
+          tar -czf ZenithProxy-resourcepack-async-linux.tar.gz -C package .
+          sha256sum ZenithProxy-resourcepack-async-linux.tar.gz > ZenithProxy-resourcepack-async-linux.tar.gz.sha256
 
       - name: Upload download bundle
         uses: actions/upload-artifact@v7
         with:
-          name: ZenithProxy-resourcepack-linux
+          name: ZenithProxy-resourcepack-async-linux
           path: |
-            ZenithProxy-resourcepack-linux.tar.gz
-            ZenithProxy-resourcepack-linux.tar.gz.sha256
+            ZenithProxy-resourcepack-async-linux.tar.gz
+            ZenithProxy-resourcepack-async-linux.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
